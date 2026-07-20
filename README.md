@@ -117,6 +117,11 @@ Each shift/queue watch goes through this automatically:
    manager wants to review it — nobody gets paged.
 4. **Reacts at any point:** marked `CONFIRMED`, flow stops — no more DMs.
 
+**Date/Time format:** type Date and Start Time into the sheet however feels
+natural — Google Sheets will auto-format them (e.g. `7/20/2026`, `12:35
+PM`), and the bot parses whatever format it ends up displaying as. No need
+to fight the spreadsheet into a specific format.
+
 ## Timezones
 
 The GitHub Actions server itself doesn't have a "home" timezone that
