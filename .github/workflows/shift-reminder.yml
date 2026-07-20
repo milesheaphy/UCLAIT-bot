@@ -1,3 +1,4 @@
+# Save this file as .github/workflows/shift-reminder.yml in your repo.
 name: Shift Reminder Bot
 
 on:
@@ -24,5 +25,4 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          MANAGER_EMAIL: ${{ secrets.MANAGER_EMAIL }}
           DEFAULT_TIMEZONE: ${{ secrets.DEFAULT_TIMEZONE }}   # leave the secret unset to use America/Los_Angeles
