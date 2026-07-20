@@ -1,118 +1,257 @@
 """
-Offline logic test for shift_reminder.py — no Slack/Google credentials needed.
+Shift Reminder Bot
+-------------------
+Reads a weekly shift schedule from a Google Sheet and DMs each person on
+Slack ~15 minutes before their shift starts. If they don't react to confirm
+they saw it, sends one follow-up DM. If they still don't react, DMs the
+manager. Designed to be run on a schedule (every 5 minutes) by GitHub
+Actions (or any other cron runner) — each run is stateless except for what
+it reads from/writes to the sheet.
 
-Mocks all network calls (Slack lookups/sends/reactions, sheet read/write) and
-feeds synthetic rows covering every state transition, then checks the bot
-did the right thing in each case. Run any time you change the script:
+Sheet columns (row 1 = header, one row per shift):
+  A: Name
+  B: Email               <- must match the person's Slack account email
+  C: Date                <- YYYY-MM-DD
+  D: Shift Start Time    <- 24-hour HH:MM
+  E: Timezone            <- IANA tz name, e.g. America/Los_Angeles.
+                             Optional — leave blank to use DEFAULT_TIMEZONE.
+  F: Status              <- script-managed, leave blank.
+                             "" -> REMINDED -> REMINDED_2 -> CONFIRMED or ESCALATED
+  G: Last Message TS     <- script-managed, leave blank. Slack ts of latest DM.
+  H: Last Sent At        <- script-managed, leave blank. ISO timestamp of latest DM.
 
-    pip install -r requirements.txt
-    python test_shift_reminder.py
+Escalation flow per shift:
+  T-15min  Reminder 1 DM sent.
+  +5min    If no emoji reaction on it yet -> Reminder 2 DM sent ("just checking").
+  +5min    If still no reaction -> DM sent to the manager flagging it.
+  (Any point) If they react to either DM -> marked CONFIRMED, flow stops.
 
-Expect: "ALL TESTS PASSED" and exit code 0.
+Required environment variables (set as GitHub Actions secrets):
+  SLACK_BOT_TOKEN              Bot token for the Slack app (xoxb-...)
+  GOOGLE_SERVICE_ACCOUNT_JSON  Full JSON key content for a Google service account
+  SHEET_ID                     The spreadsheet ID (from the sheet's URL)
+  MANAGER_EMAIL                Slack email of the manager to escalate to
+  SHEET_RANGE (optional)       Defaults to 'Sheet1!A2:H'
+  DEFAULT_TIMEZONE (optional)  Used when a row's Timezone cell is blank.
+                                Defaults to 'America/Los_Angeles'.
 """
 
 import os
-from datetime import datetime, timedelta
+import sys
+import json
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
-# Dummy values so the module's required-env-var checks pass on import.
-os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test")
-os.environ.setdefault("GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
-os.environ.setdefault("SHEET_ID", "test-sheet-id")
-os.environ.setdefault("MANAGER_EMAIL", "manager@example.com")
+import requests
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
-import shift_reminder as sr
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+SHEET_ID = os.environ["SHEET_ID"]
+MANAGER_EMAIL = os.environ["MANAGER_EMAIL"]
+SHEET_RANGE = os.environ.get("SHEET_RANGE", "Sheet1!A2:H")
+DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE") or "America/Los_Angeles"
 
-now = datetime.now(ZoneInfo("UTC"))
+WINDOW_MIN_MINUTES = int(os.environ.get("WINDOW_MIN_MINUTES", 10))
+WINDOW_MAX_MINUTES = int(os.environ.get("WINDOW_MAX_MINUTES", 20))
+FOLLOWUP_AFTER_MINUTES = int(os.environ.get("FOLLOWUP_AFTER_MINUTES", 5))
+GIVE_UP_AFTER_SHIFT_START_MINUTES = int(os.environ.get("GIVE_UP_AFTER_SHIFT_START_MINUTES", 30))
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+_user_id_cache = {}
 
 
-def row(name, email, minutes_from_now, status="", last_ts="", minutes_since_sent=None, tz="UTC"):
-    # tz="" simulates a blank Timezone cell, which should fall back to DEFAULT_TIMEZONE.
-    effective_tz = tz or sr.DEFAULT_TIMEZONE
-    t = (now + timedelta(minutes=minutes_from_now)).astimezone(ZoneInfo(effective_tz))
-    last_sent_at = (
-        (now - timedelta(minutes=minutes_since_sent)).isoformat()
-        if minutes_since_sent is not None
-        else ""
+def get_sheet_rows():
+    creds_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    service = build("sheets", "v4", credentials=creds)
+    sheet = service.spreadsheets()
+    result = sheet.values().get(spreadsheetId=SHEET_ID, range=SHEET_RANGE).execute()
+    return service, result.get("values", [])
+
+
+def update_row(service, row_index, status, message_ts, sent_at_iso):
+    sheet_row_number = row_index + 2
+    range_ = f"Sheet1!F{sheet_row_number}:H{sheet_row_number}"
+    service.spreadsheets().values().update(
+        spreadsheetId=SHEET_ID,
+        range=range_,
+        valueInputOption="RAW",
+        body={"values": [[status, message_ts or "", sent_at_iso or ""]]},
+    ).execute()
+
+
+def slack_lookup_user_id(email):
+    email = email.strip().lower()
+    if email in _user_id_cache:
+        return _user_id_cache[email]
+    resp = requests.get(
+        "https://slack.com/api/users.lookupByEmail",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        params={"email": email},
+        timeout=10,
+    ).json()
+    if not resp.get("ok"):
+        print(f"  [warn] could not find Slack user for {email}: {resp.get('error')}")
+        return None
+    user_id = resp["user"]["id"]
+    _user_id_cache[email] = user_id
+    return user_id
+
+
+def slack_open_dm(user_id):
+    resp = requests.post(
+        "https://slack.com/api/conversations.open",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        json={"users": user_id},
+        timeout=10,
+    ).json()
+    if not resp.get("ok"):
+        print(f"  [warn] could not open DM with {user_id}: {resp.get('error')}")
+        return None
+    return resp["channel"]["id"]
+
+
+def slack_send_message(channel_id, text):
+    resp = requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        json={"channel": channel_id, "text": text},
+        timeout=10,
+    ).json()
+    if not resp.get("ok"):
+        print(f"  [warn] could not send message to {channel_id}: {resp.get('error')}")
+        return None
+    return resp["message"]["ts"]
+
+
+def slack_has_reaction(channel_id, ts):
+    resp = requests.get(
+        "https://slack.com/api/reactions.get",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        params={"channel": channel_id, "timestamp": ts},
+        timeout=10,
+    ).json()
+    if not resp.get("ok"):
+        return False
+    return bool(resp.get("message", {}).get("reactions"))
+
+
+def send_dm_to_person(email, text):
+    user_id = slack_lookup_user_id(email)
+    if not user_id:
+        return None, None
+    channel_id = slack_open_dm(user_id)
+    if not channel_id:
+        return None, None
+    ts = slack_send_message(channel_id, text)
+    return channel_id, ts
+
+
+def escalate_to_manager(name, email, time_str, tz_name):
+    manager_id = slack_lookup_user_id(MANAGER_EMAIL)
+    if not manager_id:
+        print("  [warn] could not find manager's Slack account, cannot escalate")
+        return
+    channel_id = slack_open_dm(manager_id)
+    if not channel_id:
+        return
+    text = (
+        f":warning: {name} ({email}) hasn't confirmed their {time_str} ({tz_name}) "
+        f"shift reminder after two DMs. You may want to follow up directly."
     )
-    return [name, email, t.strftime("%Y-%m-%d"), t.strftime("%H:%M"), tz, status, last_ts, last_sent_at]
+    slack_send_message(channel_id, text)
 
 
-TEST_ROWS = [
-    row("Alice New", "alice@example.com", 15),  # 0: fresh, in window -> REMINDED
-    row("Bob Waiting", "bob@example.com", 5, status="REMINDED", last_ts="ts_b", minutes_since_sent=2),  # 1: too soon -> no action
-    row("Carla Silent", "carla@example.com", 5, status="REMINDED", last_ts="ts_c", minutes_since_sent=6),  # 2: overdue -> REMINDED_2
-    row("Dave Ghost", "dave@example.com", 5, status="REMINDED_2", last_ts="ts_d", minutes_since_sent=6),  # 3: overdue -> ESCALATED
-    row("Erin Confirmed", "erin@example.com", 5, status="REMINDED", last_ts="ts_e", minutes_since_sent=0),  # 4: reacted -> CONFIRMED
-    row("Frank Stale", "frank@example.com", -40, status="REMINDED", last_ts="ts_f", minutes_since_sent=45),  # 5: too old -> give up
-    row("Grace Done", "grace@example.com", 5, status="CONFIRMED", last_ts="ts_g", minutes_since_sent=6),  # 6: already terminal
-    row("Hank Default", "hank@example.com", 15, tz=""),  # 7: blank timezone -> uses DEFAULT_TIMEZONE -> REMINDED
-]
+def main():
+    service, rows = get_sheet_rows()
+    if not rows:
+        print("No schedule rows found.")
+        return
 
-updates = []
-sent = []
-REACTED_TS = {"ts_e"}
+    now_utc = datetime.now(ZoneInfo("UTC"))
+
+    for i, row in enumerate(rows):
+        row = row + [""] * (8 - len(row))
+        name, email, date_str, time_str, tz_name, status, last_ts, last_sent_at = row[:8]
+        name, email = name.strip(), email.strip()
+        tz_name = tz_name.strip() or DEFAULT_TIMEZONE
+        status = status.strip().upper()
+
+        if not (name and email and date_str and time_str):
+            continue
+        if status in ("CONFIRMED", "ESCALATED"):
+            continue
+
+        try:
+            tz = ZoneInfo(tz_name.strip())
+            shift_start = datetime.strptime(f"{date_str.strip()} {time_str.strip()}", "%Y-%m-%d %H:%M")
+            shift_start = shift_start.replace(tzinfo=tz)
+        except Exception as e:
+            print(f"  [warn] row {i}: could not parse date/time/timezone ({e})")
+            continue
+
+        minutes_until = (shift_start - now_utc).total_seconds() / 60
+
+        if status == "":
+            if WINDOW_MIN_MINUTES <= minutes_until <= WINDOW_MAX_MINUTES:
+                print(f"Row {i}: sending first reminder to {name} <{email}>")
+                text = (
+                    f"Hey {name.split()[0]}! Your shift starts at {time_str} "
+                    f"({tz_name}) today — about {round(minutes_until)} minutes from now. "
+                    f"React to this message to confirm you saw it :+1:"
+                )
+                _, ts = send_dm_to_person(email, text)
+                if ts:
+                    update_row(service, i, "REMINDED", ts, now_utc.isoformat())
+            continue
+
+        if minutes_until < -GIVE_UP_AFTER_SHIFT_START_MINUTES:
+            continue
+
+        try:
+            last_sent_dt = datetime.fromisoformat(last_sent_at)
+        except Exception:
+            continue
+        minutes_since_last = (now_utc - last_sent_dt).total_seconds() / 60
+
+        user_id = slack_lookup_user_id(email)
+        channel_id = slack_open_dm(user_id) if user_id else None
+        reacted = slack_has_reaction(channel_id, last_ts) if channel_id and last_ts else False
+
+        if reacted:
+            print(f"Row {i}: {name} confirmed (reacted)")
+            update_row(service, i, "CONFIRMED", last_ts, last_sent_at)
+            continue
+
+        if minutes_since_last < FOLLOWUP_AFTER_MINUTES:
+            continue
+
+        if status == "REMINDED":
+            print(f"Row {i}: no reaction from {name}, sending follow-up DM")
+            text = (
+                f"Just checking you saw this, {name.split()[0]} — your shift starts at "
+                f"{time_str} ({tz_name}). Please react to confirm :+1:"
+            )
+            _, ts = send_dm_to_person(email, text)
+            if ts:
+                update_row(service, i, "REMINDED_2", ts, now_utc.isoformat())
+            continue
+
+        if status == "REMINDED_2":
+            print(f"Row {i}: still no reaction from {name}, escalating to manager")
+            escalate_to_manager(name, email, time_str, tz_name)
+            update_row(service, i, "ESCALATED", last_ts, last_sent_at)
+            continue
+
+    print("Done.")
 
 
-def fake_get_sheet_rows():
-    return "FAKE_SERVICE", TEST_ROWS
-
-
-def fake_update_row(service, row_index, status, ts, sent_at):
-    updates.append((row_index, status))
-
-
-def fake_lookup(email):
-    return f"U_{email}"
-
-
-def fake_open_dm(user_id):
-    return f"D_{user_id}"
-
-
-def fake_send_message(channel_id, text):
-    sent.append((channel_id, text))
-    return f"ts_new_{len(sent)}"
-
-
-def fake_has_reaction(channel_id, ts):
-    return ts in REACTED_TS
-
-
-sr.get_sheet_rows = fake_get_sheet_rows
-sr.update_row = fake_update_row
-sr.slack_lookup_user_id = fake_lookup
-sr.slack_open_dm = fake_open_dm
-sr.slack_send_message = fake_send_message
-sr.slack_has_reaction = fake_has_reaction
-
-sr.main()
-
-updates_by_row = dict(updates)
-checks = [
-    (0, "REMINDED", updates_by_row.get(0) == "REMINDED"),
-    (1, "no action (too soon)", 1 not in updates_by_row),
-    (2, "REMINDED_2", updates_by_row.get(2) == "REMINDED_2"),
-    (3, "ESCALATED", updates_by_row.get(3) == "ESCALATED"),
-    (4, "CONFIRMED", updates_by_row.get(4) == "CONFIRMED"),
-    (5, "no action (gave up)", 5 not in updates_by_row),
-    (6, "no action (terminal)", 6 not in updates_by_row),
-    (7, "REMINDED (default tz)", updates_by_row.get(7) == "REMINDED"),
-]
-
-print("\n--- Results ---")
-all_pass = True
-for idx, expected, ok in checks:
-    status = "PASS" if ok else "FAIL"
-    if not ok:
-        all_pass = False
-    print(f"[{status}] row {idx}: expected {expected}")
-
-manager_dm_sent = any(ch == "D_U_manager@example.com" for ch, _ in sent)
-print(f"[{'PASS' if manager_dm_sent else 'FAIL'}] manager escalation DM sent: {manager_dm_sent}")
-if not manager_dm_sent:
-    all_pass = False
-
-print(f"\nTotal messages sent: {len(sent)}")
-print("ALL TESTS PASSED" if all_pass else "SOME TESTS FAILED")
-raise SystemExit(0 if all_pass else 1)
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"Fatal error: {exc}", file=sys.stderr)
+        sys.exit(1)
