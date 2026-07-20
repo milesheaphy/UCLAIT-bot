@@ -59,13 +59,16 @@ SHEET_ID = os.environ["SHEET_ID"]
 SHEET_RANGE = os.environ.get("SHEET_RANGE", "Sheet1!A2:I")
 DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE") or "America/Los_Angeles"
 
-# How far ahead (in minutes) we look for upcoming shifts to send the first
-# reminder. Since this runs every 5 minutes, a 10-20 minute window
-# guarantees each shift is caught at least once, roughly ~15 min ahead.
-# All of these can be overridden by env var for fast local testing, e.g.
-# FOLLOWUP_AFTER_MINUTES=1, without touching code or waiting on production
-# timing. Leave them unset in GitHub Actions to use the real defaults.
-WINDOW_MIN_MINUTES = int(os.environ.get("WINDOW_MIN_MINUTES", 10))
+# How far ahead of a shift (in minutes) we start trying to send the first
+# reminder. GitHub Actions' schedule is "best effort" — runs can be delayed
+# or occasionally skipped under load — so this is deliberately NOT a narrow
+# window you can miss. Once a shift is within WINDOW_MAX_MINUTES of
+# starting, every run keeps trying to send the reminder (if it hasn't
+# already) right up until GIVE_UP_AFTER_SHIFT_START_MINUTES after it
+# started. A late/skipped scheduled run just means the DM goes out a bit
+# later than ideal — it never means the reminder silently never sends.
+# Overridable by env var for fast local testing (e.g. FOLLOWUP_AFTER_MINUTES=1);
+# leave unset in GitHub Actions to use the real defaults.
 WINDOW_MAX_MINUTES = int(os.environ.get("WINDOW_MAX_MINUTES", 20))
 
 # How long to wait for a reaction before moving to the next step.
@@ -230,7 +233,11 @@ def main():
 
         # --- Step 1: no reminder sent yet ---
         if status == "":
-            if WINDOW_MIN_MINUTES <= minutes_until <= WINDOW_MAX_MINUTES:
+            # No lower bound here on purpose — if a scheduled run is
+            # delayed/skipped and we're already past the ideal ~15-minute
+            # mark, still send it late rather than never, as long as we
+            # haven't given up on the shift entirely.
+            if -GIVE_UP_AFTER_SHIFT_START_MINUTES <= minutes_until <= WINDOW_MAX_MINUTES:
                 print(f"Row {i}: sending first reminder to {name} <{email}> ({label})")
                 first_name = name.split()[0]
                 _, ts = send_dm_to_person(
