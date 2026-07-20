@@ -63,11 +63,13 @@ TEST_ROWS = [
     row("Just Missed Old Window", "latecatch@example.com", 3),  # 11: only 3 min out - the OLD 10-20 window would have missed this entirely; new logic must still REMIND
     row("Very Late Run", "verylate@example.com", -25),  # 12: shift started 25 min ago, never reminded (simulates a badly delayed/skipped scheduled run) -> must still REMIND late rather than never
     row("Too Late Now", "toolate@example.com", -35),  # 13: 35 min past start, beyond give-up -> must NOT send (correctly gives up eventually)
+    row("Late Reactor Gaming It", "lategamer@example.com", -15, status="REMINDED_2", last_ts="ts_gamer", minutes_since_sent=6),  # 14: shift started 15 min ago (past the 10-min late-reaction cutoff), reacts AFTER the fact -> must resolve NO_RESPONSE, reaction must NOT count
+    row("Reacts In Time", "intime@example.com", -8, status="REMINDED_2", last_ts="ts_intime", minutes_since_sent=6),  # 15: only 8 min past start (within the 10-min cutoff), reacts -> should still count as CONFIRMED
 ]
 
 updates = []
 sent = []
-REACTED_TS = {"ts_e"}
+REACTED_TS = {"ts_e", "ts_gamer", "ts_intime"}
 
 
 def fake_get_sheet_rows():
@@ -120,6 +122,8 @@ checks = [
     (11, "REMINDED (would've missed old narrow window)", updates_by_row.get(11) == "REMINDED"),
     (12, "REMINDED (late catch-up, run was delayed)", updates_by_row.get(12) == "REMINDED"),
     (13, "no action (past give-up point)", 13 not in updates_by_row),
+    (14, "NO_RESPONSE (late reaction doesn't count)", updates_by_row.get(14) == "NO_RESPONSE"),
+    (15, "CONFIRMED (reacted within cutoff)", updates_by_row.get(15) == "CONFIRMED"),
 ]
 
 print("\n--- Results ---")
