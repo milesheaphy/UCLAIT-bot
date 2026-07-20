@@ -49,6 +49,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
+from dateutil import parser as dateparser
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -196,7 +197,11 @@ def main():
 
         try:
             tz = ZoneInfo(tz_name.strip())
-            shift_start = datetime.strptime(f"{date_str.strip()} {time_str.strip()}", "%Y-%m-%d %H:%M")
+            # dateutil.parser handles however Google Sheets happens to format
+            # the cell (e.g. "7/20/2026" + "12:35 PM", not just strict
+            # "2026-07-20" + "13:00"), so a manager typing dates/times
+            # naturally into the sheet doesn't break parsing.
+            shift_start = dateparser.parse(f"{date_str.strip()} {time_str.strip()}")
             shift_start = shift_start.replace(tzinfo=tz)
         except Exception as e:
             print(f"  [warn] row {i}: could not parse date/time/timezone ({e})")
