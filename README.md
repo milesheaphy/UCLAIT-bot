@@ -117,6 +117,14 @@ Each shift/queue watch goes through this automatically:
    manager wants to review it — nobody gets paged.
 4. **Reacts at any point:** marked `CONFIRMED`, flow stops — no more DMs.
 
+**Reactions have a cutoff, so late reacting can't game it.** A reaction
+only counts as confirming up to 10 minutes after the shift actually
+started (`LATE_REACTION_CUTOFF_MINUTES`, configurable). Past that, the row
+resolves to `NO_RESPONSE` regardless of whether someone reacts afterward —
+this closes the gap where a delayed scheduled run might otherwise give
+someone extra time to notice they were about to be flagged and react late
+to dodge it.
+
 **Date/Time format:** type Date and Start Time into the sheet however feels
 natural — Google Sheets will auto-format them (e.g. `7/20/2026`, `12:35
 PM`), and the bot parses whatever format it ends up displaying as. No need
