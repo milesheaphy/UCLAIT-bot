@@ -60,6 +60,9 @@ TEST_ROWS = [
     row("Ivy Queue", "ivy@example.com", 15, rtype="Queue Watch"),  # 8: queue watch -> REMINDED, message says "queue watch"
     row("Reused Row", "reused@example.com", 15, status="CONFIRMED", last_ts="ts_old", minutes_since_sent=60 * 24 * 6),  # 9: row reused for a new week - old CONFIRMED from 6 days ago, Date/Time overwritten for a fresh shift -> must auto-reset and send a new reminder, not stay stuck as CONFIRMED forever
     sheets_style_row("Sheets Format", "sheetsfmt@example.com", 15),  # 10: Google Sheets' natural "7/20/2026" / "12:35 PM" format -> must still parse and REMIND
+    row("Just Missed Old Window", "latecatch@example.com", 3),  # 11: only 3 min out - the OLD 10-20 window would have missed this entirely; new logic must still REMIND
+    row("Very Late Run", "verylate@example.com", -25),  # 12: shift started 25 min ago, never reminded (simulates a badly delayed/skipped scheduled run) -> must still REMIND late rather than never
+    row("Too Late Now", "toolate@example.com", -35),  # 13: 35 min past start, beyond give-up -> must NOT send (correctly gives up eventually)
 ]
 
 updates = []
@@ -114,6 +117,9 @@ checks = [
     (8, "REMINDED (queue watch)", updates_by_row.get(8) == "REMINDED"),
     (9, "REMINDED (reused row auto-reset)", updates_by_row.get(9) == "REMINDED"),
     (10, "REMINDED (Sheets-formatted date/time)", updates_by_row.get(10) == "REMINDED"),
+    (11, "REMINDED (would've missed old narrow window)", updates_by_row.get(11) == "REMINDED"),
+    (12, "REMINDED (late catch-up, run was delayed)", updates_by_row.get(12) == "REMINDED"),
+    (13, "no action (past give-up point)", 13 not in updates_by_row),
 ]
 
 print("\n--- Results ---")
