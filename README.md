@@ -122,6 +122,15 @@ natural — Google Sheets will auto-format them (e.g. `7/20/2026`, `12:35
 PM`), and the bot parses whatever format it ends up displaying as. No need
 to fight the spreadsheet into a specific format.
 
+**Reliability note:** GitHub's schedule trigger is "best effort" — under
+load, a scheduled run can be delayed by a few minutes, or in rare cases
+skipped. The bot is built around that: it doesn't require catching a shift
+in one exact narrow window. Once a shift is within 20 minutes of starting,
+every run keeps trying to send the first reminder (if it hasn't already)
+right up until 30 minutes after it started. A delayed or skipped scheduled
+run just means the DM goes out a little later than the ideal ~15 minutes —
+it never means the reminder silently never sends.
+
 ## Timezones
 
 The GitHub Actions server itself doesn't have a "home" timezone that
