@@ -74,6 +74,15 @@ WINDOW_MAX_MINUTES = int(os.environ.get("WINDOW_MAX_MINUTES", 20))
 # How long to wait for a reaction before moving to the next step.
 FOLLOWUP_AFTER_MINUTES = int(os.environ.get("FOLLOWUP_AFTER_MINUTES", 5))
 
+# A reaction only counts as confirming up until this many minutes AFTER
+# shift start. This closes a loophole: without a hard deadline, someone
+# could notice a scheduled run got delayed and react late — even well
+# after their shift started — and still be marked CONFIRMED instead of
+# NO_RESPONSE. Past this deadline, the row resolves to NO_RESPONSE
+# immediately, regardless of a late reaction or exactly when the last DM
+# was sent.
+LATE_REACTION_CUTOFF_MINUTES = int(os.environ.get("LATE_REACTION_CUTOFF_MINUTES", 10))
+
 # Stop chasing a shift once it started this many minutes ago (avoids
 # indefinitely re-processing stale rows if something never gets resolved).
 GIVE_UP_AFTER_SHIFT_START_MINUTES = int(os.environ.get("GIVE_UP_AFTER_SHIFT_START_MINUTES", 30))
@@ -263,13 +272,29 @@ def main():
             continue
         minutes_since_last = (now_utc - last_sent_dt).total_seconds() / 60
 
-        user_id = slack_lookup_user_id(email)
-        channel_id = slack_open_dm(user_id) if user_id else None
-        reacted = slack_has_reaction(channel_id, last_ts) if channel_id and last_ts else False
+        # Hard deadline: once we're this far past shift start, a reaction
+        # no longer counts, even if one shows up. This closes the gap where
+        # a delayed scheduled run would otherwise give someone extra time
+        # to notice they were about to be marked NO_RESPONSE and react late
+        # to dodge it.
+        reaction_deadline_passed = minutes_until < -LATE_REACTION_CUTOFF_MINUTES
 
-        if reacted:
-            print(f"Row {i}: {name} confirmed (reacted)")
-            update_row(service, i, "CONFIRMED", last_ts, last_sent_at)
+        if not reaction_deadline_passed:
+            user_id = slack_lookup_user_id(email)
+            channel_id = slack_open_dm(user_id) if user_id else None
+            reacted = slack_has_reaction(channel_id, last_ts) if channel_id and last_ts else False
+
+            if reacted:
+                print(f"Row {i}: {name} confirmed (reacted)")
+                update_row(service, i, "CONFIRMED", last_ts, last_sent_at)
+                continue
+
+        if reaction_deadline_passed:
+            print(
+                f"Row {i}: reaction window closed for {name} <{email}> ({label} at "
+                f"{time_str} {tz_name}) — marking NO_RESPONSE, a late reaction no longer counts."
+            )
+            update_row(service, i, "NO_RESPONSE", last_ts, last_sent_at)
             continue
 
         if minutes_since_last < FOLLOWUP_AFTER_MINUTES:
