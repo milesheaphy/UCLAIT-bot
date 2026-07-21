@@ -4,13 +4,24 @@ name: Shift Reminder Bot
 on:
   schedule:
     # Runs every 5 minutes, offset to :02/:07/:12/:17... instead of the
-    # round :00/:05/:10 marks. GitHub's scheduler is heavily congested at
-    # exact round-number times (a huge fraction of all cron jobs on GitHub
-    # fire then), which causes runs to be delayed or dropped. Landing a
-    # few minutes off that boundary avoids most of that contention.
-    # A late/skipped run still isn't a problem — shift_reminder.py is
-    # built to keep trying rather than silently miss a reminder.
-    - cron: "2-59/5 * * * *"
+    # round :00/:05/:10 marks (avoids GitHub's scheduler congestion at
+    # exact round-number times). Restricted to roughly 8:00 AM-5:00 PM
+    # US Pacific (15:00-23:59 UTC) — an hour ahead of the 9-5 shift range
+    # and running right up to 5, so late-assigned queue watches near the
+    # end of the day still get caught. Nothing needs to fire overnight.
+    #
+    # NOTE: GitHub Actions cron has no timezone concept, so this window is
+    # hardcoded in UTC based on Pacific Daylight Time (UTC-7, in effect
+    # roughly mid-March to early November). When clocks fall back to
+    # Pacific Standard Time (UTC-8) in November, this window will
+    # effectively shift an hour later (9 AM-6 PM Pacific) until updated to
+    # "16-23,0" for the winter half of the year, and back to "15-23" next
+    # spring. Not critical to fix immediately — GitHub's own schedule
+    # trigger is just a backup here; the real one is the cron-job.org
+    # pinger below, which handles this automatically via its own timezone
+    # setting (set to America/Los_Angeles, so it adjusts for DST on its
+    # own with no manual updates needed).
+    - cron: "2-59/5 15-23 * * *"
   workflow_dispatch: {}   # lets you manually trigger a run from the Actions tab
 
 jobs:
